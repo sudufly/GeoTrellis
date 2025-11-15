@@ -1,15 +1,20 @@
 package geotrellis.demo
 
 import geotrellis.layer.stitch.TileLayoutStitcher
-import geotrellis.layer.{KeyBounds, LayoutDefinition, SpatialKey, TileLayerMetadata}
-import geotrellis.proj4.LatLng
+import geotrellis.layer.{KeyBounds, LayoutDefinition, Metadata, SpatialKey, TileLayerMetadata, ZoomedLayoutScheme}
+import geotrellis.proj4.{CRS, LatLng, WebMercator}
+import geotrellis.raster.resample.Bilinear
+import geotrellis.spark.density.RDDKernelDensity
+import geotrellis.spark.pyramid.Pyramid
+import geotrellis.store.LayerId
+import geotrellis.store.index.ZCurveKeyIndexMethod
 import geotrellis.vector._
 import org.apache.spark.rdd.RDD
 
 import scala.util._
 
 
-object KernelDensity {
+object KernelDensity extends Serializable{
 
 
   def main(args: Array[String]): Unit = {
@@ -31,7 +36,7 @@ object KernelDensity {
         Random.nextInt % 16 + 16) // the weight (attribute)
     }
 
-    val pts = (for (i <- 1 to 1000) yield randomPointFeature(extent)).toList
+    val pts = (for (i <- 1 to 10000) yield randomPointFeature(extent)).toList
 
     """
       |在这个例子中，范围的选择在很大程度上是任意的，但要注意这里的坐标是相对于我们通常所考虑的标准（经度，纬度）来选取的。
@@ -84,7 +89,7 @@ object KernelDensity {
 
     import geotrellis.spark.tiling._
 
-    val tl = TileLayout(7, 4, 100, 100)
+    val tl = TileLayout(7, 4, 1000, 1000)
     """
       |在这里，我们指定了一个7×4的瓦片网格，每个瓦片包含100×100个单元格。
       |这最终将用于把之前的整体式700×400瓦片（kde）划分成28个大小一致的子瓦片。
@@ -266,6 +271,7 @@ object KernelDensity {
       .mapValues { tile: MutableArrayTile => tile.asInstanceOf[Tile] }
 
 
+
     import geotrellis.proj4.LatLng
 
     val metadata = TileLayerMetadata(DoubleCellType,
@@ -276,7 +282,31 @@ object KernelDensity {
         SpatialKey(ld.layoutCols-1,
           ld.layoutRows-1)))
 
-    println(metadata)
+    val layoutScheme: ZoomedLayoutScheme = ZoomedLayoutScheme(WebMercator, tileSize = 256)
+    val (maxZoom, reprojected) = TileLayerRDD(tileRdd, metadata)
+      .reproject(WebMercator, layoutScheme, Bilinear)
+
+
+    Pyramid.upLevels(reprojected, layoutScheme, maxZoom, Bilinear) { (rdd, z) =>
+      val landsatId = LayerId("demo", z)
+
+      //      写出图层
+//      writer.write(landsatId, rdd, ZCurveKeyIndexMethod)
+
+      //      如果需要生成PNG则生成PNG
+
+//        renderPNG(sparkContext, z, colorRender)
+      println(s"cur level:${z}")
+
+
+
+
+    }
+    // 执行分布式核密度估计，输出 RDD[(Extent, Tile)]（每个分区的密度栅格块）
+//    val rdd: RDD[PointFeature[Double]] = pointRdd
+    CRS.fromName("")
+    val value: RDD[(SpatialKey, Tile)] with Metadata[TileLayerMetadata[SpatialKey]] = RDDKernelDensity(rdd = pointRdd, ld = ld, kern = kern, CRS.fromName(""))
+
   }
 
 }
