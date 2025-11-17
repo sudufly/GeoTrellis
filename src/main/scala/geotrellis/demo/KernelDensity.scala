@@ -1,10 +1,9 @@
 package geotrellis.demo
 
 import geotrellis.layer.stitch.TileLayoutStitcher
-import geotrellis.layer.{KeyBounds, LayoutDefinition, Metadata, SpatialKey, TileLayerMetadata, ZoomedLayoutScheme}
-import geotrellis.proj4.{CRS, LatLng, WebMercator}
+import geotrellis.layer.{KeyBounds, LayoutDefinition, SpatialKey, TileLayerMetadata, ZoomedLayoutScheme}
+import geotrellis.proj4.{LatLng, WebMercator}
 import geotrellis.raster.resample.Bilinear
-import geotrellis.spark.density.RDDKernelDensity
 import geotrellis.spark.pyramid.Pyramid
 import geotrellis.store.LayerId
 import geotrellis.store.index.ZCurveKeyIndexMethod
@@ -302,10 +301,6 @@ object KernelDensity extends Serializable{
 
 
     }
-    // 执行分布式核密度估计，输出 RDD[(Extent, Tile)]（每个分区的密度栅格块）
-//    val rdd: RDD[PointFeature[Double]] = pointRdd
-    CRS.fromName("")
-    val value: RDD[(SpatialKey, Tile)] with Metadata[TileLayerMetadata[SpatialKey]] = RDDKernelDensity(rdd = pointRdd, ld = ld, kern = kern, CRS.fromName(""))
 
   }
 
