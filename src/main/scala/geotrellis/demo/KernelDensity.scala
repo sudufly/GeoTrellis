@@ -1,9 +1,10 @@
 package geotrellis.demo
 
 import geotrellis.layer.stitch.TileLayoutStitcher
-import geotrellis.layer.{KeyBounds, LayoutDefinition, SpatialKey, TileLayerMetadata, ZoomedLayoutScheme}
-import geotrellis.proj4.{LatLng, WebMercator}
+import geotrellis.layer.{KeyBounds, LayoutDefinition, Metadata, SpatialKey, TileLayerMetadata, ZoomedLayoutScheme}
+import geotrellis.proj4.{CRS, LatLng, WebMercator}
 import geotrellis.raster.resample.Bilinear
+import geotrellis.spark.density.RDDKernelDensity
 import geotrellis.spark.pyramid.Pyramid
 import geotrellis.store.LayerId
 import geotrellis.store.index.ZCurveKeyIndexMethod
@@ -15,8 +16,8 @@ import scala.util._
 
 object KernelDensity extends Serializable{
 
-
   def main(args: Array[String]): Unit = {
+    val path = "D:\\code\\hopechart\\geo\\GeoTrellis\\"
     """
       |首先，让我们生成一组随机点，这些点的权重在（0，32）范围内。
       |为了体现 “带权重的点” 这一概念，我们创建了一个 PointFeature [Double]（它是 Feature [Point, Double] 的别名）。
@@ -63,7 +64,7 @@ object KernelDensity extends Serializable{
       ColorRamps.HeatmapBlueToYellowToRedSpectrum
     )
 
-    kde.renderPng(colorMap).write("D:\\workspace\\geo\\geotrellis-learn\\output\\test.png")
+    kde.renderPng(colorMap).write("output\\test.png")
 
     """
       |使用TIFF输出的优势在于，它会标记范围和坐标参考系（CRS），
@@ -73,7 +74,7 @@ object KernelDensity extends Serializable{
 
     import geotrellis.raster.io.geotiff._
 
-    GeoTiff(kde, extent, LatLng).write("D:\\workspace\\geo\\geotrellis-learn\\output\\test.tif")
+    GeoTiff(kde, extent, LatLng).write("output\\test.tif")
 
 
     """
@@ -194,113 +195,14 @@ object KernelDensity extends Serializable{
       }
 
     val stitched = TileLayoutStitcher.stitch(tileList)._1
-    stitched.renderPng(colorMap).write("D:\\workspace\\geo\\geotrellis-learn\\output\\dis.png")
+    stitched.renderPng(colorMap).write( "output\\dis.png")
 
 
 
 
 
 
-    //Spark
-    import org.apache.spark.{SparkConf, SparkContext}
 
-    val conf = new SparkConf().setMaster("local").setAppName("Kernel Density")
-    val sc = new SparkContext(conf)
-
-    val pointRdd = sc.parallelize(pts, 10)
-
-
-    import geotrellis.raster.density.KernelStamper
-
-    def stampPointFeature(
-                           tile: MutableArrayTile,
-                           tup: (SpatialKey, PointFeature[Double])
-                         ): MutableArrayTile = {
-      val (spatialKey, pointFeature) = tup
-      val tileExtent = ld.mapTransform(spatialKey)
-      val re = RasterExtent(tileExtent, tile)
-      val result = tile.copy.asInstanceOf[MutableArrayTile]
-
-      KernelStamper(result, kern)
-        .stampKernelDouble(re.mapToGrid(pointFeature.geom), pointFeature.data)
-
-      result
-    }
-
-    import geotrellis.raster.mapalgebra.local.LocalTileBinaryOp
-
-    object Adder extends LocalTileBinaryOp {
-      def combine(z1: Int, z2: Int) = {
-        if (isNoData(z1)) {
-          z2
-        } else if (isNoData(z2)) {
-          z1
-        } else {
-          z1 + z2
-        }
-      }
-
-      def combine(r1: Double, r2: Double) = {
-        if (isNoData(r1)) {
-          r2
-        } else if (isNoData(r2)) {
-          r1
-        } else {
-          r1 + r2
-        }
-      }
-    }
-
-    def sumTiles(t1: MutableArrayTile, t2: MutableArrayTile): MutableArrayTile = {
-      Adder(t1, t2).asInstanceOf[MutableArrayTile]
-    }
-
-
-    val function: ((MutableArrayTile, (SpatialKey, PointFeature[Double])) => MutableArrayTile, (MutableArrayTile, MutableArrayTile) => MutableArrayTile) => RDD[(SpatialKey, MutableArrayTile)] = pointRdd
-      .flatMap(ptfToSpatialKey)
-      .mapPartitions(
-        { partition =>
-          partition.map { case (spatialKey, pointFeature) =>
-            (spatialKey, (spatialKey, pointFeature))
-          }
-        }, preservesPartitioning = true)
-      .aggregateByKey(ArrayTile.empty(DoubleCellType, ld.tileCols, ld.tileRows))
-    val tileRdd: RDD[(SpatialKey, Tile)] =
-      function(stampPointFeature, sumTiles)
-      .mapValues { tile: MutableArrayTile => tile.asInstanceOf[Tile] }
-
-
-
-    import geotrellis.proj4.LatLng
-
-    val metadata = TileLayerMetadata(DoubleCellType,
-      ld,
-      ld.extent,
-      LatLng,
-      KeyBounds(SpatialKey(0,0),
-        SpatialKey(ld.layoutCols-1,
-          ld.layoutRows-1)))
-
-    val layoutScheme: ZoomedLayoutScheme = ZoomedLayoutScheme(WebMercator, tileSize = 256)
-    val (maxZoom, reprojected) = TileLayerRDD(tileRdd, metadata)
-      .reproject(WebMercator, layoutScheme, Bilinear)
-
-
-    Pyramid.upLevels(reprojected, layoutScheme, maxZoom, Bilinear) { (rdd, z) =>
-      val landsatId = LayerId("demo", z)
-
-      //      写出图层
-//      writer.write(landsatId, rdd, ZCurveKeyIndexMethod)
-
-      //      如果需要生成PNG则生成PNG
-
-//        renderPNG(sparkContext, z, colorRender)
-      println(s"cur level:${z}")
-
-
-
-
-    }
 
   }
 

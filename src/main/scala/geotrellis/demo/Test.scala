@@ -1,21 +1,60 @@
 package geotrellis.demo
 import geotrellis.layer.stitch.TileLayoutStitcher
-import geotrellis.layer.{LayoutDefinition, SpatialKey}
-import geotrellis.proj4.LatLng
+import geotrellis.layer.{KeyBounds, LayoutDefinition, Metadata, SpatialKey, TileLayerMetadata, ZoomedLayoutScheme}
+import geotrellis.proj4.{CRS, LatLng, WebMercator}
+import geotrellis.raster.{MutableArrayTile, isNoData}
 import geotrellis.raster.io.geotiff.GeoTiff
 import geotrellis.raster.mapalgebra.focal.Kernel
+import geotrellis.raster.resample.Bilinear
+import geotrellis.spark.TileLayerRDD
+import geotrellis.spark.density.RDDKernelDensity
+import geotrellis.spark.pyramid.Pyramid
+import geotrellis.store.LayerId
 import geotrellis.vector._
+import org.apache.spark.rdd.RDD
 
 import scala.util._
 
 object Test {
+    import geotrellis.raster.mapalgebra.local.LocalTileBinaryOp
+
+    /***
+     * 自定义瓦片加法操作
+     * 自定义瓦片合并逻辑，正确处理无数据值
+     * 确保在合并瓦片时，无数据值不会影响有效数据的累加
+     */
+    object Adder extends LocalTileBinaryOp {
+        def combine(z1: Int, z2: Int) = {
+            if (isNoData(z1)) {
+                z2  // 如果z1是无数据，返回z2
+            } else if (isNoData(z2)) {
+                z1  // 如果z2是无数据，返回z1
+            } else {
+                z1 + z2  // 否则相加
+            }
+        }
+
+        def combine(r1: Double, r2: Double) = {
+            if (isNoData(r1)) {
+                r2
+            } else if (isNoData(r2)) {
+                r1
+            } else {
+                r1 + r2
+            }
+        }
+    }
+
+    def sumTiles(t1: MutableArrayTile, t2: MutableArrayTile): MutableArrayTile = {
+        Adder(t1, t2).asInstanceOf[MutableArrayTile]
+    }
 
     def main(args: Array[String]): Unit = {
         /**
          * 第一部分：生成带权重的随机点要素（核密度估计的输入数据）
          * 核密度估计的核心是“带权重的点”——每个点对周围区域的密度贡献由权重和核函数决定
          */
-        // 定义目标区域范围：科罗拉多州的经纬度范围（xmin, ymin, xmax, ymax）
+        // 定义目标区域范围：经纬度范围（xmin, ymin, xmax, ymax）
         val extent = Extent(-109, 37, -102, 41)
 
         /**
@@ -66,6 +105,9 @@ object Test {
             rasterExtent = RasterExtent(extent, 700, 400)
         )
 
+        println("kde1:" + kde.findMinMax._1)
+        println("kde2:" + kde.findMinMax._2)
+
         /**
          * 输出基础版结果：PNG图片（可视化）和GeoTIFF（空间参考保留）
          */
@@ -76,14 +118,14 @@ object Test {
         )
 
         // 输出PNG图片（无空间参考，仅用于快速可视化）
-        kde.renderPng(colorMap).write("D:\\workspace\\geo\\geotrellis-learn\\output\\test.png")
+        kde.renderPng(colorMap).write("output\\test.png")
 
         // 输出GeoTIFF文件（包含范围和CRS，可在QGIS等GIS软件中叠加显示）
          GeoTiff(
             tile = kde,
             extent = extent,
             crs = LatLng // 坐标参考系：WGS84经纬度（EPSG:4326）
-        ).write("D:\\workspace\\geo\\geotrellis-learn\\output\\test.tif")
+        ).write("output\\test.tif")
 
         /**
          * 第三部分：进阶版——瓦片细分式核密度计算（适合大规模数据）
@@ -199,7 +241,77 @@ object Test {
          * 输出进阶版结果：拼接后的瓦片保存为PNG
          * 最终结果与基础版完全一致，但支持大规模数据的并行处理
          */
-        stitched.renderPng(colorMap).write("D:\\workspace\\geo\\geotrellis-learn\\output\\dis.png")
+        stitched.renderPng(colorMap).write("output\\dis.png")
+
+
+
+
+
+        //Spark
+        import org.apache.spark.{SparkConf, SparkContext}
+
+        val conf = new SparkConf().setMaster("local").setAppName("Kernel Density")
+        val sc = new SparkContext(conf)
+
+        val pointRdd = sc.parallelize(pts, 10)
+
+
+        import geotrellis.raster.density.KernelStamper
+
+        def stampPointFeature(
+                               tile: MutableArrayTile,
+                               tup: (SpatialKey, PointFeature[Double])
+                             ): MutableArrayTile = {
+            val (spatialKey, pointFeature) = tup
+            val tileExtent = ld.mapTransform(spatialKey)
+            val re = RasterExtent(tileExtent, tile)
+            val result = tile.copy.asInstanceOf[MutableArrayTile]
+
+            KernelStamper(result, kern)
+              .stampKernelDouble(re.mapToGrid(pointFeature.geom), pointFeature.data)
+
+            result
+        }
+
+
+
+
+        val function: ((MutableArrayTile, (SpatialKey, PointFeature[Double])) => MutableArrayTile, (MutableArrayTile, MutableArrayTile) => MutableArrayTile) => RDD[(SpatialKey, MutableArrayTile)] = pointRdd
+          .flatMap(ptfToSpatialKey)
+          .mapPartitions(
+              { partition =>
+                  partition.map { case (spatialKey, pointFeature) =>
+                      (spatialKey, (spatialKey, pointFeature))
+                  }
+              }, preservesPartitioning = true)
+          .aggregateByKey(ArrayTile.empty(DoubleCellType, ld.tileCols, ld.tileRows))
+        val tileRdd: RDD[(SpatialKey, Tile)] =
+            function(stampPointFeature, sumTiles)
+              .mapValues { tile: MutableArrayTile => tile.asInstanceOf[Tile] }
+        import geotrellis.layer.stitch.TileLayoutStitcher
+
+        {
+            val tuples: Array[(SpatialKey, Tile)] = tileRdd.collect()
+            val stitched: Tile = TileLayoutStitcher.stitch(tuples)._1
+
+            stitched.renderPng(colorMap).write("output\\tt.png")
+            //    val value: RDD[(SpatialKey, Tile)] with Metadata[TileLayerMetadata[SpatialKey]] = RDDKernelDensity(pointRdd, ld, kern, CRS.fromEpsgCode(4326))
+
+        }
+
+        {
+            // 注释掉的代码：使用GeoTrellis内置的核密度函数
+            // 与手动实现相比，内置函数更简洁但灵活性较低
+            val value: RDD[(SpatialKey, Tile)] with Metadata[TileLayerMetadata[SpatialKey]] =
+            RDDKernelDensity(pointRdd, ld, kern, CRS.fromEpsgCode(4326))
+            val tuples: Array[(SpatialKey, Tile)] = value.collect()
+            val stitched: Tile = TileLayoutStitcher.stitch(tuples)._1
+
+            stitched.renderPng(colorMap).write("output\\tt1.png")
+            //    val value: RDD[(SpatialKey, Tile)] with Metadata[TileLayerMetadata[SpatialKey]] = RDDKernelDensity(pointRdd, ld, kern, CRS.fromEpsgCode(4326))
+
+        }
+
     }
 
 }
